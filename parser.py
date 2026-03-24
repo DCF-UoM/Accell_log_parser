@@ -22,21 +22,44 @@ import argparse
 import re
 from pathlib import Path
 from typing import Iterable, List, Dict, Tuple, Optional
+from datetime import datetime
 
 import pandas as pd
 from pypdf import PdfReader
+
 
 
 # --- Configuration you can tweak ------------------------------------------------
 
 # Section headers seen in these logs; extend if you encounter new ones.
 SECTION_HEADERS = [
+    # Sources
     "Source 2",
     "Source 1",
+    "Source B",
+
+    # Accelerator blocks
     "Pre Acceleration",
     "Accelerator",
     "Post Acceleration",
+
+    # Facility/line-specific blocks
+    "7.5SH-2 Accelerator",
+    "7.5SH-2 Vacuum",
+    "7.5SH-2 Machine Setup",
+
+    # Beamlines (observed)
+    "+15 Degree Beamline",
     "-15 Degree Beamline",
+    "-4 Degree Beamline",
+    "B1 Beamline",
+
+    # Optional/seen in earlier configs (keep for future logs)
+    "+30 Degree Beamline",
+    "-30 Degree Beamline",
+    "A1 Beamline",
+
+    # Global
     "Faraday Cups",
     "Vacuum",
     "Machine Setup",
@@ -44,27 +67,109 @@ SECTION_HEADERS = [
 
 # Common units found in the logs; extend as needed (e.g., add 'mbar', 'Hz', 's', etc.).
 UNITS = {
-    "sccm", "A", "V", "kV", "mA", "uA", "C", "G", "T", "mm", "psig", "DegC",
-    "MV", "%", "AMU", "Pa/Ta", "u"
+    # Flows & currents & voltages
+    "sccm", "A", "mA", "uA", "V", "kV",
+
+    # Fields, pressure, position
+    "G", "T", "mm", "psig", "Pa/Ta",
+
+    # Temperatures
+    "DegC", "C",
+
+    # Energies and scales
+    "MV", "MeV", "%", "AMU", "m/q",
+
+    # Misc (observed in logs)
+    "W", "kW", "u", "Trn",
 }
 
 # Optional: helps skip non-data prefixes faster; not strictly required.
 LIKELY_PARAM_STARTS = {
+    # Common families already in your script
     "MV","FIL","ARC","EXT","FOC","GAP","BIA","OVN","CHM","INJ","IGC","ES","EL",
     "IM","TNK","CH","COL","CPS","TPS","GS","MQ","MS","SM","HPB","SS","IP","CVG","FC",
-    "SETUP"
+    "SETUP", "PRB", "MAG", "VEL", "RAS", "DS", "ION", "IML", "CAT", "MCS", "SETUP-B",
 }
 
-# Literal value words we’ve seen
-VALUE_LITERALS = {"gvm", "out", "in", "TORVIS", "He"}  # extend as needed
+SUFFIX_TAGS = {
+    # Short, universal tags
+    "VC","VR","CR","CC","PR","DR","DC","TR","WR",
 
-# Tokens that typically PRECEDE a literal (non-numeric) value.
-# Many of these end with 'SR'; generalize with endswith('SR').
-LITERAL_VALUE_KEYS = {"AtomNumb", "SrcSel", "BLsel"}  # explicit list; 'SR' keys handled by suffix rule
+    # Axis/corrector tags
+    "XVC","YVC","XVR","+XVR","-XVR","+YVR","-YVR","+VR","-VR",
 
+    # TPS/energy/control family
+    "GvmVR","TrvVC","ModeSR","LEsltCR","HEsltCR","CtlGain","CPOgain",
+
+    # Probe and grid
+    "PrbDC","PrbDR","PrbCR","PrbQCC","GridVR",
+
+    # Magnets / misc readbacks
+    "Strength","Balance","XCR","YCR","YCC","XCC","MfieldR","LastCR","CatNumR",
+
+    # Injection/calcs
+    "TotInjV","VELcalc","m/q_calc","k",
+
+    # States & selectors
+    "PosSR","PosSC","SyncSC",
+
+    # Machine setup
+    "TotPartE","TotMachE","TotInjE","Ispecies","Ospecies","ChgState","AtomNumb","SrcSel","BLsel",
+
+    # Site-specific oddities
+    "CRlost",   # e.g., CH TX-n CRlost
+}
+
+# Literal value
+VALUE_LITERALS = {
+    # States / modes
+    "open", "closed", "moving", "internal", "gvm", "SNICS", "TORVIS",
+
+    # Element symbols observed
+    "H", "He", "Kr", "Au",
+
+    # Selector codes commonly used as values
+    "S1", "S2",
+    "LA", "LB", "L3", "L5",
+    # (Feel free to extend with others as they appear)
+}
+
+# Any token ending with SR or Sel is already handled in your code (…SR / …Sel).
+# These are extra, explicit keys observed to take literal values:
+LITERAL_VALUE_KEYS = {
+    "AtomNumb",  # H, He, Kr, Au, ...
+    "SrcSel",    # S1, S2, ...
+    "BLsel",     # LA, L3, L5, ...
+    "PosSC",     # open/closed
+    "SyncSC",    # internal
+    # SR keys (redundant but harmless if you want to be explicit)
+    "PolSR", "ModeSR", "PosSR",
+}
 INDEX_TOKEN_RE = re.compile(r"^[+-]?\d+(?:-\d+)?$")  # -1, 1, 01-1, 2-3, etc.
 
 # --- Helpers --------------------------------------------------------------------
+
+# --- Section header detection (with optional prefix code) -----------------------
+
+# Prefer longer headers first (e.g., "Source 2" before "Source")
+_HEADERS_SORTED = sorted(SECTION_HEADERS, key=len, reverse=True)
+_HEADER_ALT = "|".join(map(re.escape, _HEADERS_SORTED))
+
+# A "section code" immediately before the header, e.g., "7.5SH-2 Machine Setup"
+#   - starts with an alphanumeric
+#   - may contain letters, digits, dots, or hyphens
+# We require the match to start at a word boundary (or line start) and end at a word boundary.
+SECTION_RE = re.compile(
+    rf"""
+    (?<!\S)                                   # start of line or whitespace (no non-space before)
+    (?:
+        (?P<prefix>[A-Za-z0-9][A-Za-z0-9.\-]*)\s+   # optional code like 7.5SH-2
+    )?
+    (?P<header>(?:{_HEADER_ALT}))             # one of the known headers
+    (?=\s|$)                                  # followed by space or end of line
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
 NUM_RE = re.compile(
     r"""
@@ -75,6 +180,26 @@ NUM_RE = re.compile(
     """,
     re.VERBOSE,
 )
+
+# Timestamp at start of the first line, e.g. "19-Dec-2025 10:33:01 DCF Dual Beam ..."
+DATE_RE = re.compile(r"(?m)^\s*(\d{2}-[A-Za-z]{3}-\d{4})\s+(\d{2}:\d{2}:\d{2})\b")
+
+def extract_page_timestamp(page_text: str) -> Optional[str]:
+    """
+    Find the 'DD-Mon-YYYY HH:MM:SS' timestamp in a page and return ISO 'YYYY-MM-DD HH:MM:SS'.
+    Returns None if not found or parse fails.
+    """
+    m = DATE_RE.search(page_text)
+    if not m:
+        return None
+    dt_raw = f"{m.group(1)} {m.group(2)}"
+    try:
+        # %b = locale-independent English month abbrev in Python's datetime
+        dt = datetime.strptime(dt_raw, "%d-%b-%Y %H:%M:%S")
+        return dt.isoformat(sep=" ", timespec="seconds")
+    except Exception:
+        # Fall back to raw if strict parsing fails (rare)
+        return dt_raw
 
 def is_number(tok: str) -> bool:
     return bool(NUM_RE.match(tok))
@@ -109,50 +234,51 @@ def expects_literal_after(last_param_token: str) -> bool:
         or last_param_token in LITERAL_VALUE_KEYS
     )
 
-
 def is_literal_value_given_context(tok: str, param_tokens: list[str]) -> bool:
     """
     Accept a token as a literal value if:
       - it is explicitly listed (e.g., TORVIS, gvm, out, He), OR
-      - the preceding param token expects a literal, and this token is not a number
-        and not a new parameter start (unit-like appearance is allowed here).
+      - the preceding param token expects a literal (…SR / …Sel / explicit list),
+        and this token is not a number (uppercase codes like LA, S2, L3 are allowed).
     """
     if tok in VALUE_LITERALS:
         return True
     if param_tokens and expects_literal_after(param_tokens[-1]):
-        # IMPORTANT: do NOT reject on looks_like_unit() here,
-        # otherwise codes like S2/L3 will be blocked.
-        if not is_number(tok) and not is_probable_param_start(tok):
-            return True
+        # IMPORTANT: do not exclude tokens that look like units or parameter starts;
+        # in this context, codes like LA, S2, L3 are valid literal values.
+        return not is_number(tok)
     return False
-
 
 def is_index_token(tok: str) -> bool:
     # Numeric tokens that are often part of a parameter path, not the value
     return bool(INDEX_TOKEN_RE.match(tok))
 
 def is_suffix_tag(tok: str) -> bool:
-    """
-    Tags that can follow an index and are part of the parameter:
-    examples: PR, CR, VC, VR, DC, DR, +VR, -VR, YVC, XVC, LastCR, TotInjV, etc.
-    Heuristics:
-      - starts with '+' or '-' followed by letters/digits (e.g., +VR, -VR), OR
-      - looks like a short-ish tag beginning with a capital letter (PR, VC, YVC, LastCR, TotInjV).
-    """
-    if tok.startswith(('+', '-')) and re.match(r"^[\+\-][A-Za-z][A-Za-z0-9]*$", tok):
+    """Only treat it as a suffix tag if it is explicitly listed."""
+    if tok in SUFFIX_TAGS:
         return True
-    # Permit CamelCase and all-caps tags commonly seen in these logs
-    return bool(re.match(r"^[A-Z][A-Za-z0-9]{1,10}$", tok))
+    # Handle +VR / -VR style by stripping the sign and checking again
+    if tok and tok[0] in {"+", "-"} and tok[1:] in SUFFIX_TAGS:
+        return True
+    return False
 
 def find_section_in_line(line: str) -> Tuple[Optional[str], str]:
     """
-    If a known section header appears in the line, return (header, line_without_that_header_once).
-    Otherwise, (None, line).
+    Detect a section header in the line, optionally preceded by a code like '7.5SH-2'.
+    Returns (full_section_text, line_with_that_span_removed) or (None, original_line).
     """
-    for header in SECTION_HEADERS:
-        if header in line:
-            return header, line.replace(header, " ", 1)
-    return None, line
+    m = SECTION_RE.search(line)
+    if not m:
+        return None, line
+
+    prefix = m.group("prefix") or ""
+    header = m.group("header")
+    full = (prefix + " " + header).strip()
+
+    # Remove the entire matched slice so prefix/header tokens don't leak into parsing
+    new_line = (line[:m.start()] + " " + line[m.end():]).strip()
+    return full, new_line
+
 
 
 def parse_line_into_rows(
@@ -169,9 +295,14 @@ def parse_line_into_rows(
     if section:
         current_section = section
 
-    # Skip document header lines entirely
-    if re.search(r"\bDCF\s+Dual\s+Beam\b", work_line, flags=re.IGNORECASE):
-        return [], current_section
+    
+    # Strip document-banner text if present, but keep the rest of the line
+    work_line = re.sub(
+        r"""\bDCF\s+Dual\s+Beam\b(?:\s+Page\s+\d+\s+of\s+\d+)?""",
+        "",
+        work_line,
+        flags=re.IGNORECASE,
+    ).strip()
 
     tokens = work_line.strip().split()
     if not tokens:
@@ -263,11 +394,15 @@ def extract_pdf_to_rows(pdf_path: Path) -> List[Dict]:
     for p_idx, page in enumerate(reader.pages, start=1):
         # pypdf returns None if no text was found
         page_text = page.extract_text() or ""
+        page_ts = extract_page_timestamp(page_text)
         for raw_line in page_text.splitlines():
             rows, current_section = parse_line_into_rows(
                 raw_line, pdf_path.name, p_idx, current_section
             )
             if rows:
+                for r in rows:
+                    r["timestamp"] = page_ts or ""
+
                 all_rows.extend(rows)
 
     return all_rows
@@ -305,7 +440,7 @@ def main():
 
     df = pd.DataFrame(
         all_rows,
-        columns=["file", "page", "section", "parameter", "value_raw", "value_num", "unit"],
+        columns=["file", "page", "timestamp", "section", "parameter", "value_raw", "value_num", "unit"],
     )
 
     # Deduplicate and sort for readability
