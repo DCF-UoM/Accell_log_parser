@@ -26,7 +26,7 @@ from datetime import datetime
 
 import pandas as pd
 from pypdf import PdfReader
-
+from pypdf.errors import PdfReadError, PdfStreamError
 
 
 # --- Configuration you can tweak ------------------------------------------------
@@ -387,7 +387,12 @@ def parse_line_into_rows(
 
 
 def extract_pdf_to_rows(pdf_path: Path) -> List[Dict]:
-    reader = PdfReader(str(pdf_path))
+    try:
+        reader = PdfReader(str(pdf_path))
+    except (PdfStreamError, PdfReadError, OSError) as e:
+        print(f"Skipping corrupted or invalid PDF: {pdf_path} ({e})")
+        return []  # return empty rows so script continues
+
     all_rows: List[Dict] = []
     current_section: Optional[str] = None
 
