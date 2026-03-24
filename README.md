@@ -7,3 +7,10 @@ Requirements:
 - python 3
 - pandas
 - pypdf
+
+
+run the downloader
+
+then the parser with the flags:
+
+python parser.py downloads -o all_logs.csv
